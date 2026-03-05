@@ -1,0 +1,14 @@
+
+
+# SAP RFC SDK logs (contain connection details)
+_noderfc.log
+dev_rfc.log
+
+# Node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db

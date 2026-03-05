@@ -1,0 +1,1166 @@
+require("dotenv").config();
+const express = require("express");
+const cors    = require("cors");
+const jwt     = require("jsonwebtoken");
+const { Client } = require("node-rfc");
+const axios   = require("axios");
+const { buildSapPass1Prompt, SAP_PASS2_PROMPT } = require("./prompts/sapInterpreter");
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",")
+  : ["http://localhost:5173"];
+
+/* ===============================
+   SAP SYSTEM CONFIG
+================================= */
+
+const SAP_SYSTEM_CONFIGS = {
+  PRD: { ashost: "49.207.9.62", sysnr: "25", client: "100", description: "S4H 2023" },
+  QAS: { ashost: "49.207.9.62", sysnr: "25", client: "100", description: "S4H 2023" },
+  DEV: { ashost: "49.207.9.62", sysnr: "25", client: "100", description: "S4H 2023" }
+};
+
+/* ===============================
+   SAP BUSINESS DEFAULTS
+   (Change here — nowhere else)
+================================= */
+
+const SAP_DEFAULTS = {
+  companyCode    : "1000",  // Default company code
+  purchasingOrg  : "1000",  // Default purchasing organisation
+  purchasingGroup: "001",   // Default purchasing group
+  plant          : "1000",  // Default plant
+  documentType   : "NB",    // Standard purchase order
+  currency       : "USD",   // Default currency
+
+  // Module routing (as per summary.md enterprise architecture)
+  modules: {
+    FI: ["Vendor", "Invoice", "Customer", "CompanyCode"],     // Finance
+    MM: ["PurchaseOrder", "PurchaseRequisition", "Material"], // Materials Management
+  }
+};
+
+/* ===============================
+   BAPI SECURITY WHITELIST
+   Only these functions may be called
+================================= */
+
+const ALLOWED_FUNCTIONS = new Set([
+  // ── MM – Materials Management ───────────────
+  'BAPI_PO_CREATE1',              // Create Purchase Order
+  'BAPI_PO_CHANGE',               // Change Purchase Order
+  'BAPI_PO_GETDETAIL1',           // Display Purchase Order
+  'BAPI_PR_CREATE',               // Create Purchase Requisition
+  'BAPI_PR_CHANGE',               // Change Purchase Requisition
+  'BAPI_REQUISITION_GETDETAIL',   // Display Purchase Requisition
+  'BAPI_GOODSMVT_CREATE',         // Goods Movement (GR/GI)
+  'BAPI_GOODSMVT_GETDETAIL',      // Display Goods Movement
+  'BAPI_MATERIAL_GET_ALL',        // Display Material Master (all views)
+  'BAPI_MATERIAL_GET_DETAIL',     // Display Material Master (detail)
+  'BAPI_MATERIAL_SAVEDATA',       // Create/Change Material Master
+  'BAPI_VENDOR_GETDETAIL',        // Display Vendor
+  'BAPI_VENDOR_CREATE',           // Create Vendor
+  'BAPI_CONTRACT_CREATE',         // Create Outline Agreement
+  'BAPI_CONTRACT_CHANGE',         // Change Outline Agreement
+  'BAPI_CONTRACT_GETDETAIL',      // Display Outline Agreement
+  'BAPI_SA_CREATE',               // Create Scheduling Agreement
+  'BAPI_SA_CHANGE',               // Change Scheduling Agreement
+  'BAPI_QUOTA_ARR_MAINTAIN',      // Maintain Quota Arrangement
+  'BAPI_INFOSOURCE_GETLIST',      // Info Record List
+  'BAPI_INFORECORD_GETDETAIL',    // Display Info Record
+  'BAPI_INFORECORD_CREATE1',      // Create Info Record
+
+  // ── SD – Sales & Distribution ───────────────
+  'BAPI_SALESORDER_CREATEFROMDAT2', // Create Sales Order
+  'BAPI_SALESORDER_CHANGE',         // Change Sales Order
+  'BAPI_SALESORDER_GETLIST',        // List Sales Orders
+  'BAPI_SALESORDER_GETSTATUS',      // Sales Order Status
+  'BAPI_DELIVERYPROCESSING_EXEC',   // Create Delivery
+  'BAPI_OUTB_DELIVERY_CHANGE',      // Change Delivery
+  'BAPI_OUTB_DELIVERY_GET_DET',     // Display Delivery
+  'BAPI_BILLINGDOC_CREATEMULTIPLE', // Create Billing Document
+  'BAPI_BILLINGDOC_GETDETAIL',      // Display Billing Document
+  'BAPI_CUSTOMERRETURN_CREATE',     // Create Returns Order
+  'BAPI_CREDITCHECK_GETDETAIL',     // Credit Check
+  'BAPI_CUSTOMER_GETDETAIL2',       // Display Customer
+  'BAPI_CUSTOMER_CREATEFROMDATA1',  // Create Customer
+  'BAPI_CUSTOMER_CHANGEFROMDATA1',  // Change Customer
+
+  // ── PP – Production Planning ─────────────────
+  'BAPI_PRODORD_CREATE',            // Create Production Order
+  'BAPI_PRODORD_CHANGE',            // Change Production Order
+  'BAPI_PRODORD_GET_DETAIL',        // Display Production Order
+  'BAPI_PRODORD_RELEASE',           // Release Production Order
+  'BAPI_PRODORDCONF_CREATE_HDR',    // Confirm Production Order
+  'BAPI_PRODORDCONF_GETDETAIL',     // Display Confirmation
+  'BAPI_PLANNEDORDER_CREATE',       // Create Planned Order
+  'BAPI_PLANNEDORDER_CHANGE',       // Change Planned Order
+  'BAPI_PLANNEDORDER_GET_DET',      // Display Planned Order
+  'BAPI_PROCORD_CREATE',            // Create Process Order
+  'BAPI_PROCORD_CHANGE',            // Change Process Order
+  'BAPI_PROCORD_GET_DETAIL',        // Display Process Order
+  'BAPI_BOM_HEADR_READ',            // Read BOM
+  'BAPI_ROUTING_GET',               // Read Routing/Recipe
+
+  // ── PM – Plant Maintenance ───────────────────
+  'BAPI_ALM_ORDER_MAINTAIN',        // Create/Change Maintenance Order
+  'BAPI_ALM_ORDER_GET_DETAIL',      // Display Maintenance Order
+  'BAPI_ALM_NOTIF_CREATE',          // Create Notification
+  'BAPI_ALM_NOTIF_DATA_MODIFY',     // Change Notification
+  'BAPI_ALM_NOTIF_GET_DETAIL',      // Display Notification
+  'BAPI_ALM_NOTIF_CLOSE',           // Close Notification
+  'BAPI_ALM_NOTIF_COMPLETE',        // Complete Notification
+  'BAPI_EQUI_CREATE',               // Create Equipment
+  'BAPI_EQUI_CHANGE',               // Change Equipment
+  'BAPI_EQUI_GETDETAIL',            // Display Equipment
+  'BAPI_FUNCLOC_CREATE',            // Create Functional Location
+  'BAPI_FUNCLOC_CHANGE',            // Change Functional Location
+  'BAPI_FUNCLOC_GETDETAIL',         // Display Functional Location
+  'BAPI_MEASPOINT_GETDETAIL',       // Display Measurement Point
+  'BAPI_MEAS_DOC_CREATE',           // Create Measurement Document
+
+  // ── FI – Financial Accounting ────────────────
+  'BAPI_ACC_DOCUMENT_POST',         // Post FI Document
+  'BAPI_ACC_DOCUMENT_REV_POST',     // Reverse FI Document
+  'BAPI_ACC_DOCUMENT_CHECK',        // Check FI Document
+  'BAPI_GL_ACC_GETDETAIL',          // Display G/L Account
+  'BAPI_GL_ACC_GETPERIODBALANCES',  // G/L Period Balances
+  'BAPI_GL_ACC_GETLIST',            // G/L Account List
+  'BAPI_AP_ACC_GETKEYDATEBAL',      // AP Key Date Balance
+  'BAPI_AR_ACC_GETKEYDATEBAL',      // AR Key Date Balance
+  'BAPI_AP_ACC_GETOPENITEMS',       // AP Open Items
+  'BAPI_AR_ACC_GETOPENITEMS',       // AR Open Items
+  'BAPI_INCOMINGINVOICE_CREATE',    // Create Incoming Invoice
+  'BAPI_INCOMINGINVOICE_CHANGE',    // Change Incoming Invoice
+  'BAPI_INCOMINGINVOICE_GETDETAIL', // Display Incoming Invoice
+  'BAPI_ASSET_ACQUISITION_POST',    // Post Asset Acquisition
+  'BAPI_ASSET_RETIREMENT_POST',     // Post Asset Retirement
+  'BAPI_ASSET_GETDETAIL',           // Display Asset
+
+  // ── CO – Controlling ─────────────────────────
+  'BAPI_COSTCENTER_GETDETAIL',       // Display Cost Center
+  'BAPI_COSTCENTER_GETLIST',         // List Cost Centers
+  'BAPI_COSTCENTER_CREATEMULTIPLE',  // Create Cost Center
+  'BAPI_COSTCENTER_CHANGEMULTIPLE',  // Change Cost Center
+  'BAPI_PROFITCENTER_GETDETAIL',     // Display Profit Center
+  'BAPI_PROFITCENTER_CREATE',        // Create Profit Center
+  'BAPI_PROFITCENTER_CHANGE',        // Change Profit Center
+  'BAPI_INTERNALORDER_GETDETAIL',    // Display Internal Order
+  'BAPI_INTERNALORDER_CREATE',       // Create Internal Order
+  'BAPI_INTERNALORDER_CHANGE',       // Change Internal Order
+  'BAPI_ACC_CO_DOCUMENT_POST',       // Post CO Document
+  'BAPI_ACC_ACTIVITY_ALLOC_POST',    // Post Activity Allocation
+  'BAPI_ACC_ASSESS_POST',            // Post Assessment
+  'BAPI_ACC_STAT_KEY_FIG_POST',      // Post Statistical Key Figures
+
+  // ── QM – Quality Management ──────────────────
+  'BAPI_INSPLOT_CREATE',             // Create Inspection Lot
+  'BAPI_INSPLOT_GETDETAIL',          // Display Inspection Lot
+  'BAPI_INSPLOT_CHANGE',             // Change Inspection Lot
+  'BAPI_INSPLOT_SETUSAGEDECISION',   // Create Usage Decision
+  'BAPI_QUALNOT_CREATE',             // Create Quality Notification
+  'BAPI_QUALNOT_MODIFY',             // Change Quality Notification
+  'BAPI_QUALNOT_GETDETAIL',          // Display Quality Notification
+  'BAPI_QUALNOT_CLOSE',              // Close Quality Notification
+  'BAPI_QUALNOT_COMPLETE',           // Complete Quality Notification
+  'BAPI_QUALNOT_SAVE',               // Save Quality Notification
+  'BAPI_INSPOPER_GETDETAIL',         // Display Inspection Operation
+  'BAPI_INSPRESULT_RECORD',          // Record Inspection Results
+  'BAPI_CHARACT_GETDETAIL',          // Display Characteristic
+
+  // ── PS – Project System ───────────────────────
+  'BAPI_PROJECT_GETINFO',            // Display Project
+  'BAPI_PROJECT_MAINTAIN',           // Create/Change Project
+  'BAPI_BUS2054_CREATE_MULTI',       // Create WBS Elements
+  'BAPI_BUS2054_CHANGE_MULTI',       // Change WBS Elements
+  'BAPI_BUS2054_GETDETAIL',          // Display WBS Element
+  'BAPI_NETWORK_MAINTAIN',           // Create/Change Network
+  'BAPI_NETWORK_GETDETAIL',          // Display Network
+  'BAPI_PS_ACTIV_MAINTAIN',          // Maintain Network Activities
+  'BAPI_PS_MILESTONE_MAINTAIN',      // Maintain Milestones
+
+  // ── WM – Warehouse Management ────────────────
+  'BAPI_WHSE_TO_CREATE_STOCK',       // Create Transfer Order (Stock)
+  'BAPI_WHSE_TO_CREATE_PO',          // Create Transfer Order (PO)
+  'BAPI_WHSE_TO_GET_DETAIL',         // Display Transfer Order
+  'BAPI_WHSE_TO_CONFIRM',            // Confirm Transfer Order
+  'BAPI_WHSE_TR_CREATE',             // Create Transfer Requirement
+  'BAPI_WHSE_TR_GET_DETAIL',         // Display Transfer Requirement
+  'BAPI_WHSE_STOCK_GET_LIST',        // Get Warehouse Stock
+  'L_TO_CREATE_MULTIPLE',            // Bulk Transfer Order Creation (FM)
+
+  // ── HCM – Human Capital Management ───────────
+  'BAPI_EMPLOYEE_GETDATA',           // Display Employee Data
+  'BAPI_EMPLOYEE_ENQUEUE',           // Lock Employee Record
+  'BAPI_EMPLOYEE_DEQUEUE',           // Unlock Employee Record
+  'BAPI_PERSDATA_GETDETAIL',         // Display Personal Data
+  'BAPI_ORGUNIT_GETDETAIL',          // Display Org Unit
+  'BAPI_ABSENCE_CREATE',             // Create Absence
+  'BAPI_ABSENCE_GETDETAIL',          // Display Absence
+  'BAPI_ATTENDANCE_CREATE',          // Create Attendance
+  'BAPI_CATIMESHEETMGR_INSERT',      // Create Time Entry (CATS)
+  'BAPI_PAYSLIP_GETDETAIL',          // Display Payslip
+  'BAPI_TRIP_CREATE_FROM_DATA',      // Create Travel Expense
+  'HR_INFOTYPE_OPERATION',           // HR Infotype Operation (hire/modify)
+
+  // ── BASIS / Cross-Module ─────────────────────
+  'RFC_READ_TABLE',                  // Read any SAP table
+  'BAPI_TRANSACTION_COMMIT',         // Commit write transaction
+  'BAPI_TRANSACTION_ROLLBACK',       // Rollback on failure
+  'BAPI_USER_GET_DETAIL',            // Display SAP User
+  'BAPI_USER_CHANGE',                // Change SAP User
+  'BAPI_USER_CREATE1',               // Create SAP User
+  'BAPI_USER_LOCK',                  // Lock User
+  'BAPI_USER_UNLOCK',                // Unlock User
+  'BAPI_HELPVALUES_GET',             // F4 Value Help
+  'BAPI_DOCUMENT_CREATE2',           // Create DMS Document
+  'BAPI_DOCUMENT_GETDETAIL2',        // Display DMS Document
+  'BAPI_COMPANYCODE_GETLIST',        // List Company Codes
+  'BAPI_SALESORDER_GETLIST',         // (duplicate, SD alias)
+  'BAPI_MATERIAL_GETLIST',           // Material List
+  'BAPI_COSTCENTER_GETLIST',         // Cost Center List (alias)
+]);
+
+// Verbs that indicate a write operation — used to decide COMMIT/ROLLBACK
+const WRITE_VERBS = [
+  'CREATE','CHANGE','POST','SAVE','MAINTAIN','RELEASE','CLOSE','COMPLETE',
+  'MODIFY','CANCEL','CONFIRM','RECORD','INSERT','LOCK','UNLOCK','REVERSE',
+  'ROLLBACK','RETIRE','ACQUIRE','ENQUEUE'
+];
+
+function isWriteBapi(funcName) {
+  if (funcName === 'RFC_READ_TABLE' || funcName === 'BAPI_TRANSACTION_COMMIT' || funcName === 'BAPI_TRANSACTION_ROLLBACK') return false;
+  const upper = funcName.toUpperCase();
+  return WRITE_VERBS.some(v => upper.includes(v));
+}
+
+
+/* ===============================
+   BAPI FORM FIELD DEFINITIONS
+   Frontend uses these to render interactive input forms.
+   key=SAP field, type=text|number|date, required=true/false
+================================= */
+const BAPI_FIELD_DEFINITIONS = {
+  BAPI_PO_CREATE1: [
+    { key:'VENDOR',        label:'Vendor',               description:'Supplier account number',                    example:'0017300001', type:'text',   required:true  },
+    { key:'COMP_CODE',     label:'Company Code',         description:'Company code (Bukrs)',                       example:'1000',       type:'text',   required:true  },
+    { key:'PURCH_ORG',     label:'Purchasing Org',       description:'Purchasing organisation',                    example:'1000',       type:'text',   required:true  },
+    { key:'PUR_GROUP',     label:'Purchasing Group',     description:'Buyer group code',                          example:'001',        type:'text',   required:true  },
+    { key:'MATERIAL',      label:'Material',             description:'Material number',                           example:'100-100',    type:'text',   required:true  },
+    { key:'PLANT',         label:'Plant',                description:'Plant / factory code',                      example:'1000',       type:'text',   required:true  },
+    { key:'QUANTITY',      label:'Quantity',             description:'Order quantity',                            example:'100',        type:'number', required:true  },
+    { key:'DELIVERY_DATE', label:'Delivery Date',        description:'Required delivery date (YYYYMMDD)',         example:'20260601',   type:'date',   required:true  },
+    { key:'NET_PRICE',     label:'Net Price',            description:'Price per unit (optional)',                 example:'150.00',     type:'number', required:false },
+    { key:'CURRENCY',      label:'Currency',             description:'Currency code',                             example:'USD',        type:'text',   required:false },
+  ],
+  BAPI_PR_CREATE: [
+    { key:'MATERIAL',      label:'Material',             description:'Material number',                           example:'100-100',    type:'text',   required:true  },
+    { key:'PLANT',         label:'Plant',                description:'Plant code',                                example:'1000',       type:'text',   required:true  },
+    { key:'QUANTITY',      label:'Quantity',             description:'Requested quantity',                        example:'50',         type:'number', required:true  },
+    { key:'DELIV_DATE',    label:'Delivery Date',        description:'Required delivery date (YYYYMMDD)',         example:'20260601',   type:'date',   required:true  },
+    { key:'ACCTASSCAT',    label:'Account Assignment',   description:'K=Cost Center, F=Order, blank=Stock',      example:'K',          type:'text',   required:false },
+    { key:'COST_CENTER',   label:'Cost Center',          description:'Required if Account Assignment = K',        example:'4100',       type:'text',   required:false },
+  ],
+  BAPI_SALESORDER_CREATEFROMDAT2: [
+    { key:'SOLD_TO',       label:'Customer (Sold-To)',   description:'Customer number',                           example:'0000001000', type:'text',   required:true  },
+    { key:'SALES_ORG',     label:'Sales Org',            description:'Sales organisation',                       example:'1000',       type:'text',   required:true  },
+    { key:'DISTR_CHAN',    label:'Distribution Channel', description:'Distribution channel code',                 example:'10',         type:'text',   required:true  },
+    { key:'DIVISION',      label:'Division',             description:'Product division',                          example:'00',         type:'text',   required:true  },
+    { key:'MATERIAL',      label:'Material',             description:'Material or product number',                example:'AS-100',     type:'text',   required:true  },
+    { key:'TARGET_QTY',    label:'Quantity',             description:'Order quantity',                            example:'10',         type:'number', required:true  },
+    { key:'REQ_DATE',      label:'Requested Date',       description:'Customer requested delivery date (YYYYMMDD)',example:'20260601',  type:'date',   required:true  },
+    { key:'CURRENCY',      label:'Currency',             description:'Document currency',                         example:'USD',        type:'text',   required:false },
+  ],
+  BAPI_PRODORD_CREATE: [
+    { key:'MATERIAL',      label:'Material',             description:'Finished / semi-finished material',         example:'100-100',    type:'text',   required:true  },
+    { key:'PLANT',         label:'Plant',                description:'Production plant',                          example:'1000',       type:'text',   required:true  },
+    { key:'ORDER_TYPE',    label:'Order Type',           description:'PP01=Standard, PP02=Rework, PI01=Process',  example:'PP01',       type:'text',   required:true  },
+    { key:'QUANTITY',      label:'Quantity',             description:'Planned production quantity',               example:'500',        type:'number', required:true  },
+    { key:'START_DATE',    label:'Start Date',           description:'Basic start date (YYYYMMDD)',               example:'20260310',   type:'date',   required:true  },
+    { key:'END_DATE',      label:'End Date',             description:'Required finish date (YYYYMMDD)',           example:'20260325',   type:'date',   required:true  },
+  ],
+  BAPI_ALM_NOTIF_CREATE: [
+    { key:'NOTIF_TYPE',    label:'Notification Type',    description:'M1=Malfunction, M2=Maintenance, M3=Activity',example:'M2',       type:'text',   required:true  },
+    { key:'SHORT_TEXT',    label:'Short Text',           description:'Brief description of the issue',            example:'Pump overheating', type:'text', required:true },
+    { key:'EQUIPMENT',     label:'Equipment No.',        description:'Equipment number (if available)',           example:'10000521',   type:'text',   required:false },
+    { key:'FUNCT_LOC',     label:'Functional Location',  description:'Functional location (if no equipment)',    example:'1000-PL01',  type:'text',   required:false },
+    { key:'PRIOK',         label:'Priority',             description:'1=Very High, 2=High, 3=Medium, 4=Low',     example:'2',          type:'text',   required:false },
+    { key:'STRMN',         label:'Required Start',       description:'Required start date (YYYYMMDD)',            example:'20260310',   type:'date',   required:false },
+    { key:'LTRMN',         label:'Required End',         description:'Required finish date (YYYYMMDD)',           example:'20260315',   type:'date',   required:false },
+  ],
+  BAPI_ACC_DOCUMENT_POST: [
+    { key:'DOC_TYPE',      label:'Document Type',        description:'SA=G/L, KR=Vendor Invoice, DR=Customer',   example:'SA',         type:'text',   required:true  },
+    { key:'COMP_CODE',     label:'Company Code',         description:'Company code',                             example:'1000',       type:'text',   required:true  },
+    { key:'DOC_DATE',      label:'Document Date',        description:'Document date (YYYYMMDD)',                  example:'20260305',   type:'date',   required:true  },
+    { key:'PSTNG_DATE',    label:'Posting Date',         description:'Posting date (YYYYMMDD)',                   example:'20260305',   type:'date',   required:true  },
+    { key:'GL_DEBIT',      label:'Debit G/L Account',    description:'Debit G/L account number',                 example:'0000400000', type:'text',   required:true  },
+    { key:'GL_CREDIT',     label:'Credit G/L Account',   description:'Credit G/L account number',                example:'0000113100', type:'text',   required:true  },
+    { key:'AMOUNT',        label:'Amount',               description:'Transaction amount',                        example:'1000.00',    type:'number', required:true  },
+    { key:'CURRENCY',      label:'Currency',             description:'Transaction currency',                      example:'USD',        type:'text',   required:true  },
+  ],
+  BAPI_GOODSMVT_CREATE: [
+    { key:'MOVE_TYPE',     label:'Movement Type',        description:'101=GR for PO, 201=GI to Order, 301=Transfer',example:'101',     type:'text',   required:true  },
+    { key:'MATERIAL',      label:'Material',             description:'Material number',                           example:'100-100',    type:'text',   required:true  },
+    { key:'PLANT',         label:'Plant',                description:'Plant code',                                example:'1000',       type:'text',   required:true  },
+    { key:'STGE_LOC',      label:'Storage Location',     description:'Storage location code',                     example:'0001',       type:'text',   required:true  },
+    { key:'QUANTITY',      label:'Quantity',             description:'Movement quantity',                         example:'100',        type:'number', required:true  },
+    { key:'PO_NUMBER',     label:'PO Number',            description:'Purchase order (for movement type 101)',    example:'4500001234', type:'text',   required:false },
+    { key:'PSTNG_DATE',    label:'Posting Date',         description:'Posting date (YYYYMMDD)',                   example:'20260305',   type:'date',   required:false },
+  ],
+  BAPI_QUALNOT_CREATE: [
+    { key:'NOTIF_TYPE',    label:'Notification Type',    description:'Q1=Customer Complaint, Q2=Vendor, Q3=Internal',example:'Q3',    type:'text',   required:true  },
+    { key:'SHORT_TEXT',    label:'Short Text',           description:'Description of the quality issue',          example:'Surface defect on batch', type:'text', required:true },
+    { key:'MATERIAL',      label:'Material',             description:'Affected material number',                  example:'100-100',    type:'text',   required:true  },
+    { key:'PLANT',         label:'Plant',                description:'Plant code',                                example:'1000',       type:'text',   required:true  },
+    { key:'BATCH',         label:'Batch',                description:'Batch number (if applicable)',              example:'BATCH001',   type:'text',   required:false },
+    { key:'QUANTITY',      label:'Defect Qty',           description:'Defective quantity',                        example:'10',         type:'number', required:false },
+  ],
+  BAPI_ABSENCE_CREATE: [
+    { key:'EMPLOYEE_ID',   label:'Employee ID',          description:'Personnel number (8 digits)',               example:'00001234',   type:'text',   required:true  },
+    { key:'ABSENCE_TYPE',  label:'Absence Type',         description:'Absence type code',                         example:'0100',       type:'text',   required:true  },
+    { key:'BEGIN_DATE',    label:'Start Date',           description:'Absence start date (YYYYMMDD)',             example:'20260310',   type:'date',   required:true  },
+    { key:'END_DATE',      label:'End Date',             description:'Absence end date (YYYYMMDD)',               example:'20260315',   type:'date',   required:true  },
+  ],
+  BAPI_COSTCENTER_CREATEMULTIPLE: [
+    { key:'COSTCENTER',    label:'Cost Center',          description:'New cost center ID (10 digits)',            example:'0000004200', type:'text',   required:true  },
+    { key:'COMP_CODE',     label:'Company Code',         description:'Company code',                             example:'1000',       type:'text',   required:true  },
+    { key:'CO_AREA',       label:'Controlling Area',     description:'Controlling area code',                     example:'1000',       type:'text',   required:true  },
+    { key:'NAME',          label:'Name',                 description:'Cost center name',                          example:'IT Operations', type:'text', required:true },
+    { key:'CATEGORY',      label:'Category',             description:'E=Overhead, F=Production, H=Helper',        example:'E',          type:'text',   required:true  },
+    { key:'VALID_FROM',    label:'Valid From',           description:'Validity start date (YYYYMMDD)',            example:'20260101',   type:'date',   required:true  },
+    { key:'VALID_TO',      label:'Valid To',             description:'Validity end date (YYYYMMDD)',              example:'99991231',   type:'date',   required:true  },
+  ],
+};
+
+/* ===============================
+   MIDDLEWARE
+================================= */
+
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
+app.use(express.json({ limit: '1mb' })); // Prevent oversized payload attacks
+
+// ── Simple in-memory rate limiter (no extra dep needed) ──────────────
+const rateLimitMap = {};
+app.use((req, res, next) => {
+  if (req.path === '/api/health') return next(); // skip health checks
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  const now = Date.now();
+  if (!rateLimitMap[ip]) rateLimitMap[ip] = [];
+  // Keep only timestamps within the last 60 seconds
+  rateLimitMap[ip] = rateLimitMap[ip].filter(t => now - t < 60000);
+  if (rateLimitMap[ip].length >= 60) { // max 60 requests/min per IP
+    return res.status(429).json({ message: 'Too many requests. Please wait a moment.' });
+  }
+  rateLimitMap[ip].push(now);
+  next();
+});
+
+// Clean up rate limit map every 5 min to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const ip of Object.keys(rateLimitMap)) {
+    rateLimitMap[ip] = rateLimitMap[ip].filter(t => now - t < 60000);
+    if (rateLimitMap[ip].length === 0) delete rateLimitMap[ip];
+  }
+}, 300000);
+app.use((req, res, next) => {
+  if (req.path === "/api/sap/login" || req.path === "/api/health") {
+    return next();
+  }
+  authenticate(req, res, next);
+});
+
+function authenticate(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ message: "No token provided" });
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ message: "Invalid token" });
+  }
+}
+
+app.use((req, res, next) => {
+  if (req.method !== "OPTIONS") {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  }
+  next();
+});
+
+/* ===============================
+   HEALTH CHECK
+================================= */
+
+app.get("/api/health", (_, res) => {
+  res.json({ status: "ok" });
+});
+
+/* ===============================
+   SAP LOGIN
+================================= */
+
+app.post("/api/sap/login", async (req, res) => {
+  const { system, client, userId, password, language } = req.body;
+
+  if (!SAP_SYSTEM_CONFIGS[system])
+    return res.status(400).json({ message: "Invalid SAP system" });
+
+  const connParams = {
+    ashost: SAP_SYSTEM_CONFIGS[system].ashost,
+    sysnr: SAP_SYSTEM_CONFIGS[system].sysnr,
+    client,
+    user: userId,
+    passwd: password,
+    lang: language || "EN"
+  };
+
+  let rfcClient;
+  try {
+    rfcClient = new Client(connParams);
+    await rfcClient.open();
+
+    const result = await rfcClient.call("BAPI_USER_GET_DETAIL", {
+      USERNAME: userId.toUpperCase()
+    });
+
+    const token = jwt.sign(
+      { userId, client, system },
+      JWT_SECRET,
+      { expiresIn: "8h" }
+    );
+
+    res.json({
+      token,
+      user: {
+        userId,
+        firstName: result.ADDRESS?.FIRSTNAME,
+        lastName: result.ADDRESS?.LASTNAME,
+        email: result.ADDRESS?.E_MAIL,
+        client,
+        system: SAP_SYSTEM_CONFIGS[system].description
+      }
+    });
+
+  } catch (err) {
+    return res.status(401).json({ message: err.message });
+  } finally {
+    if (rfcClient) await rfcClient.close();
+  }
+});
+
+/* ===============================
+   GET USER INFO
+================================= */
+
+app.get("/api/sap/user-info", authenticate, (req, res) => {
+  res.json(req.user);
+});
+
+/* ===============================
+   RFC_READ_TABLE PARSER
+================================= */
+
+function parseRfcTable(data, fields, delimiter = "~") {
+  return (data || []).map(row => {
+    const values = (row.WA || "").split(delimiter);
+    const result = {};
+    (fields || []).forEach((f, i) => {
+      result[f.FIELDNAME] = (values[i] || "").trim();
+    });
+    return result;
+  });
+}
+
+/* ===============================
+   FETCH VENDORS  (LFB1 + LFA1)
+   Avoids BAPI_VENDOR_GETLIST auth
+================================= */
+
+async function fetchVendorsByCompanyCode(userTokenData, companyCode, search = "") {
+  // Step 1 — Read LFB1 (company-code-specific vendor data)
+  const lfb1Res = await executeSapRfc(userTokenData, "RFC_READ_TABLE", {
+    QUERY_TABLE: "LFB1",
+    DELIMITER:   "~",
+    FIELDS: [
+      { FIELDNAME: "LIFNR" },
+      { FIELDNAME: "BUKRS" },
+      { FIELDNAME: "ZTERM" },   // Payment Terms
+      { FIELDNAME: "AKONT" }    // Recon Account
+    ],
+    OPTIONS: [{ TEXT: `BUKRS EQ '${companyCode}'` }],
+    ROWCOUNT: 200
+  });
+
+  const lfb1Rows = parseRfcTable(lfb1Res.DATA, lfb1Res.FIELDS);
+  if (lfb1Rows.length === 0) return [];
+
+  // Step 2 — Build WHERE options for LFA1 (one OR per vendor number)
+  const lifnrList = lfb1Rows.map(r => r.LIFNR);
+  const lfa1Options = lifnrList.map((lifnr, i) => ({
+    TEXT: (i === 0 ? `LIFNR EQ '${lifnr}'` : `OR LIFNR EQ '${lifnr}'`)
+  }));
+
+  const lfa1Res = await executeSapRfc(userTokenData, "RFC_READ_TABLE", {
+    QUERY_TABLE: "LFA1",
+    DELIMITER:   "~",
+    FIELDS: [
+      { FIELDNAME: "LIFNR" },
+      { FIELDNAME: "NAME1" },   // Vendor Name
+      { FIELDNAME: "ORT01" },   // City
+      { FIELDNAME: "LAND1" },   // Country
+      { FIELDNAME: "SPERR" }    // Central Block
+    ],
+    OPTIONS: lfa1Options
+  });
+
+  const lfa1Rows = parseRfcTable(lfa1Res.DATA, lfa1Res.FIELDS);
+
+  // Step 3 — Build LFA1 lookup map
+  const lfa1Map = {};
+  lfa1Rows.forEach(r => { lfa1Map[r.LIFNR] = r; });
+
+  // Step 4 — Join and optionally filter by name search
+  let vendors = lfb1Rows
+    .filter(r => lfa1Map[r.LIFNR])
+    .map(r => {
+      const g = lfa1Map[r.LIFNR];
+      return {
+        vendorNumber : r.LIFNR,
+        name         : g.NAME1        || "",
+        city         : g.ORT01        || "",
+        country      : g.LAND1        || "",
+        companyCode  : r.BUKRS,
+        paymentTerms : r.ZTERM        || "",
+        reconAccount : r.AKONT        || "",
+        blocked      : g.SPERR === "X"
+      };
+    });
+
+  if (search) {
+    const q = search.toUpperCase();
+    vendors = vendors.filter(v => v.name.toUpperCase().includes(q));
+  }
+
+  return vendors;
+}
+
+/* ===============================
+   GET VENDORS ENDPOINT
+================================= */
+
+app.get("/api/sap/vendors", async (req, res) => {
+  const companyCode = (req.query.companyCode || "1000").toString().padEnd(4, " ").substring(0,4);
+  const search      = (req.query.search || "").trim();
+
+  console.log(`\n→ Fetching vendors | Company Code: ${companyCode}${search ? ` | Search: ${search}` : ""}`);
+
+  try {
+    const vendors = await fetchVendorsByCompanyCode(req.user, companyCode, search);
+
+    if (vendors.length === 0) {
+      return res.json({ vendors: [], total: 0, message: `No vendors found for company code ${companyCode}` });
+    }
+
+    console.log(`← Found ${vendors.length} vendor(s)`);
+    return res.json({ vendors, total: vendors.length, companyCode });
+
+  } catch (err) {
+    console.error("SAP VENDOR LIST error:", err.message);
+    return res.status(500).json({ message: `SAP Error: ${err.message}` });
+  }
+});
+
+/* ===============================
+   SAP RFC EXECUTOR
+================================= */
+
+async function executeSapRfc(userTokenData, functionName, params, autoCommit = false) {
+  // Map system description back to system key
+  const systemKey = Object.keys(SAP_SYSTEM_CONFIGS).find(
+    k => SAP_SYSTEM_CONFIGS[k].description === userTokenData.system
+  ) || userTokenData.system || "PRD";
+
+  const sysConfig = SAP_SYSTEM_CONFIGS[systemKey];
+  if (!sysConfig) throw new Error(`Unknown SAP system: ${userTokenData.system}`);
+
+  const connParams = {
+    ashost: sysConfig.ashost,
+    sysnr: sysConfig.sysnr,
+    client: userTokenData.client || sysConfig.client,
+    user: userTokenData.userId,
+    passwd: process.env.SERVICE_PASSWORD,
+    lang: "EN"
+  };
+
+  console.log(`\n→ RFC Call: ${functionName}`);
+  // Log only param keys (not values) to avoid leaking sensitive data in logs
+  console.log("  Param keys:", Object.keys(params).join(', '));
+
+  const rfcClient = new Client(connParams);
+  try {
+    await rfcClient.open();
+    const result = await rfcClient.call(functionName, params);
+    console.log(`← RFC Result keys: ${Object.keys(result).join(", ")}`);
+    
+    if (autoCommit) {
+      const returnMsgs = result.RETURN || [];
+      const errors = Array.isArray(returnMsgs) 
+        ? returnMsgs.filter(r => r.TYPE === 'E' || r.TYPE === 'A')
+        : (returnMsgs.TYPE === 'E' || returnMsgs.TYPE === 'A' ? [returnMsgs] : []);
+        
+      if (errors.length === 0) {
+        console.log(`→ Executing BAPI_TRANSACTION_COMMIT in the same SAP session...`);
+        await rfcClient.call("BAPI_TRANSACTION_COMMIT", { WAIT: "X" });
+        console.log(`✅ Transaction committed successfully.`);
+      } else {
+        console.log(`⚠️ Auto-commit aborted due to BAPI errors in result.`);
+      }
+    }
+    
+    return result;
+  } finally {
+    await rfcClient.close();
+  }
+}
+
+/* ===============================
+   PASS 1: OpenAI generates SAP call
+   (User message → RFC call JSON)
+================================= */
+
+// ── Store last executed query per user session for follow-up context ──
+const lastQueryByUser = {};
+
+async function aiGenerateSapCall(conversationHistory, latestMessage, lastQuery) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey.startsWith("YOUR_")) {
+    throw new Error("OPENAI_API_KEY not configured in .env");
+  }
+
+  // ── DYNAMIC PROMPT: only include chunks relevant to this message ────
+  const dynamicPrompt = buildSapPass1Prompt(latestMessage);
+  const messages = [{ role: "system", content: dynamicPrompt }];
+
+  // ── AUTO CACHE CLEAR: Trim history by turn count AND total character budget ──
+  // Prevents slow responses and context drift on long conversations.
+  const MAX_HISTORY_TURNS = 8;     // Keep at most N turns
+  const MAX_HISTORY_CHARS = 6000;  // Hard cap on total characters sent to AI
+
+  let recentHistory = conversationHistory.slice(-MAX_HISTORY_TURNS);
+
+  // Drop oldest turns until total chars fit within budget (always keep at least 2 turns)
+  let totalChars = recentHistory.reduce((sum, t) => sum + (t.content || '').length, 0);
+  while (recentHistory.length > 2 && totalChars > MAX_HISTORY_CHARS) {
+    const dropped = recentHistory.shift();
+    totalChars -= (dropped.content || '').length;
+    console.log(`  🧹 Auto-cache: dropped oldest turn (${(dropped.content||'').length} chars). Remaining: ${recentHistory.length} turns / ${totalChars} chars`);
+  }
+
+  for (const turn of recentHistory) {
+    const role = turn.role === "assistant" ? "assistant" : "user";
+    let content = (turn.content || "").trim();
+
+    if (role === "assistant" && content.length > 300) {
+      // Extract key metadata from the response instead of raw-truncating
+      // Look for table/record info like "✅ LFB1 + LFA1: 42 record(s)"
+      const tableMatch = content.match(/✅\s*([\w\s+]+):\s*(\d+)\s*record/);
+      const headerMatch = content.match(/\|([^|]+(?:\|[^|]+)+)\|/); // First table header row
+
+      if (tableMatch) {
+        const tables = tableMatch[1].trim();
+        const count = tableMatch[2];
+        let fields = '';
+        if (headerMatch) {
+          fields = headerMatch[1].split('|').map(f => f.trim()).filter(f => f && !f.includes('---')).join(', ');
+        }
+        content = `[PREVIOUS RESULT: ${tables}, ${count} records. Columns: ${fields || 'various'}. This was a tabular result shown to the user.]`;
+      } else {
+        // For non-table responses (PO details, single values), keep more context
+        content = content.substring(0, 500) + "... [truncated]";
+      }
+    }
+
+    if (content) messages.push({ role, content });
+  }
+
+  // Inject the PREVIOUS QUERY context so AIknows exactly what was executed
+  if (lastQuery && lastQuery.length > 0) {
+    const queryDesc = lastQuery.map(c => {
+      const tbl = c.params?.QUERY_TABLE || c.params?.PURCHASEORDER || c.function;
+      const fields = (c.params?.FIELDS || []).map(f => f.FIELDNAME).join(', ');
+      const where = (c.params?.OPTIONS || []).map(o => o.TEXT).join(' ');
+      return `${c.function}(${tbl}) — fields: [${fields}] — where: ${where || 'none'}`;
+    }).join('\n');
+    messages.push({ role: "system", content: `CONTEXT — The PREVIOUS SAP query that was executed for this user:\n${queryDesc}\n\nIf the user wants to MODIFY or ADD to these results, build a NEW query that includes the same tables/filters PLUS the additional tables needed. Do NOT re-read old data — write a fresh complete query.` });
+  }
+
+  // Append latest message
+  const last = recentHistory[recentHistory.length - 1];
+  if (!last || last.role !== "user" || last.content !== latestMessage) {
+    messages.push({ role: "user", content: latestMessage });
+  }
+
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    // Pass 1 uses gpt-4o (full model) for maximum accuracy in SAP call generation
+    // This is where reasoning matters most — wrong table/field = SAP error
+    { model: "gpt-4o", response_format: { type: "json_object" }, messages },
+    { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, timeout: 60000 }
+  );
+
+  const raw = response.data.choices[0].message.content;
+  console.log("\n[Pass 1 — AI Generated Call]", raw);
+  return JSON.parse(raw);
+}
+
+/* ===============================
+   PASS 2: OpenAI formats SAP result
+   (Raw SAP data → Human answer)
+================================= */
+
+async function aiFormatResult(userMessage, sapCallInfo, sapResult) {
+  const apiKey = process.env.OPENAI_API_KEY;
+
+  // ── For large table results, build the table server-side ──────────
+  // This avoids token overflow and ensures ALL rows are shown
+  const resultEntries = Object.entries(sapResult);
+  const tableEntry = resultEntries.find(([k, v]) => v && v.rows && v.rows.length > 15);
+
+  if (tableEntry) {
+    const [, data] = tableEntry;
+    // Build table server-side — just ask AI for a short title
+    const LABELS = {
+      LIFNR: 'Vendor No.', NAME1: 'Name', NAME2: 'Name 2', ORT01: 'City', LAND1: 'Country',
+      BUKRS: 'Co. Code', AKONT: 'Recon Acct', ZTERM: 'Pay Terms', ZWELS: 'Pay Method',
+      SPERR: 'Blocked', LOEVM: 'Deleted', EBELN: 'PO No.', EBELP: 'Item', MATNR: 'Material',
+      MENGE: 'Qty', MEINS: 'Unit', NETPR: 'Net Price', NETWR: 'Net Value', WERKS: 'Plant',
+      MAKTX: 'Description', STRAS: 'Street', PSTLZ: 'Postal Code', TELF1: 'Phone',
+      BSART: 'Doc Type', EKORG: 'Purch Org', EKGRP: 'Purch Grp', WAERS: 'Currency',
+      BEDAT: 'Doc Date', AEDAT: 'Changed', ERNAM: 'Created By', ADRNR: 'Address'
+    };
+
+    // Skip columns that are entirely empty
+    const activeFields = data.fields.filter(f =>
+      data.rows.some(row => row[f] && row[f].trim())
+    );
+
+    let table = `✅ ${data.table}: ${data.rowCount} record(s)\n\n`;
+    // Header
+    table += '| ' + activeFields.map(f => LABELS[f] || f).join(' | ') + ' |\n';
+    table += '|' + activeFields.map(() => '---').join('|') + '|\n';
+    // Rows — keep values as-is (including leading zeros per user request)
+    data.rows.forEach(row => {
+      table += '| ' + activeFields.map(f => (row[f] || '').trim() || '—').join(' | ') + ' |\n';
+    });
+
+    return table;
+  }
+
+  // ── For smaller results / BAPI data, let AI format ────────────────
+  const resultStr = JSON.stringify(sapResult).substring(0, 30000);
+
+  const messages = [
+    { role: "system", content: SAP_PASS2_PROMPT },
+    { role: "user", content: `User asked: "${userMessage}"\n\nSAP Function called: ${sapCallInfo}\n\nSAP Result:\n${resultStr}` }
+  ];
+
+  const response = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    { model: "gpt-4o-mini", messages },
+    { headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" }, timeout: 60000 }
+  );
+
+  return response.data.choices[0].message.content;
+}
+
+/* ===============================
+   CHAT ENDPOINT — 2-Pass AI Proxy
+================================= */
+
+app.post("/api/chat" , async (req, res) => {
+  try {
+    const message = (req.body.message || req.body.prompt || "").trim();
+    if (!message) {
+      return res.status(400).json({ message: "A non-empty message is required." });
+    }
+
+    const history = Array.isArray(req.body.history) ? req.body.history : [];
+    const userId = req.user.userId;
+
+    console.log(`\n=== CHAT [${req.user.userId}] ===`);
+    console.log("Message  :", message);
+    console.log("History  :", history.length, "turns");
+
+    // ═══════════════════════════════════════
+    //  PASS 1: AI decides what SAP call to make
+    // ═══════════════════════════════════════
+    let aiCall;
+    try {
+      aiCall = await aiGenerateSapCall(history, message, lastQueryByUser[userId]);
+    } catch (aiErr) {
+      console.error("Pass 1 error:", aiErr.message);
+      return res.status(503).json({ reply: `AI service error: ${aiErr.message}` });
+    }
+
+    // Handle error responses from AI
+    if (aiCall.error) {
+      return res.json({ reply: `❌ ${aiCall.error}` });
+    }
+
+    // Handle greeting / conversational / field-collection responses
+    if (aiCall.function === "NONE") {
+      const rawReply    = aiCall.reply || "How can I help you with SAP today?";
+      const collectingFor = aiCall.collectingFor || null;
+      const formTitle   = aiCall.formTitle || null;
+
+      // ── AI generates formFields itself — relay through, fallback to BAPI_FIELD_DEFINITIONS ──
+      const formFields = aiCall.formFields?.length > 0
+        ? aiCall.formFields
+        : (collectingFor && BAPI_FIELD_DEFINITIONS[collectingFor]
+            ? BAPI_FIELD_DEFINITIONS[collectingFor]
+            : []);
+
+      // ── Always build a visible markdown table in the reply so the user sees the fields ──
+      // Frontend can ALSO use the formFields array to render interactive inputs
+      let reply = rawReply;
+      if (formFields.length > 0) {
+        const title      = formTitle ? `\n### 📋 ${formTitle}\n` : '';
+        const header     = `| # | Field | Description | Example |`;
+        const separator  = `|---|---|---|---|`;
+        const rows = formFields.map((f, i) => {
+          const required = f.required ? ' *(required)*' : ' *(optional)*';
+          return `| ${i + 1} | **${f.label}**${required} | ${f.description} | \`${f.example}\` |`;
+        }).join('\n');
+
+        const requiredCount  = formFields.filter(f => f.required).length;
+        const optionalCount  = formFields.length - requiredCount;
+        const footer = `\n> Fill in all **${requiredCount} required** field${requiredCount !== 1 ? 's' : ''} and submit.` +
+                       (optionalCount > 0 ? ` *(${optionalCount} optional)*` : '');
+
+        reply = `${title}${rawReply}\n\n${header}\n${separator}\n${rows}${footer}`;
+        console.log(`  📋 Form [${collectingFor}]: ${formFields.length} fields (${requiredCount} required)`);
+      }
+
+      return res.json({ reply, collectingFor, formFields, formTitle });
+    }
+
+
+    // ═══════════════════════════════════════
+    //  EXECUTE: Run the SAP call(s)
+    // ═══════════════════════════════════════
+
+    // Normalize to array — AI may return:
+    //   { function: "X", params: {...} }                    → single call
+    //   { calls: [{ function: "X" }, { function: "Y" }] }  → array wrapped in object (json_object mode)
+    //   [{ function: "X" }, { function: "Y" }]              → raw array (rarely)
+    let calls;
+    if (Array.isArray(aiCall)) {
+      calls = aiCall;
+    } else if (Array.isArray(aiCall.calls)) {
+      calls = aiCall.calls;
+    } else if (aiCall.function) {
+      calls = [aiCall];
+    } else {
+      // Try to find any array property that contains function calls
+      const arrayProp = Object.values(aiCall).find(v => Array.isArray(v) && v.length > 0 && v[0].function);
+      calls = arrayProp || [aiCall];
+    }
+
+    const allResults = {};
+
+    // Save this query so the NEXT message has context for follow-ups
+    lastQueryByUser[userId] = calls;
+
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      const funcName = call.function;
+      const params = call.params || {};
+
+      // ── Safety net: Auto-inject FIELDS if AI forgot them (prevents SAP error 559) ──
+      if (funcName === "RFC_READ_TABLE") {
+        if (!params.FIELDS || params.FIELDS.length === 0) {
+          const SAFE_FIELDS = {
+            LFA1: ['LIFNR','NAME1','NAME2','ORT01','LAND1','STRAS','PSTLZ','REGIO','TELF1'],
+            LFB1: ['LIFNR','BUKRS','AKONT','ZTERM','ZWELS','SPERR','LOEVM'],
+            EKKO: ['EBELN','BUKRS','BSART','LIFNR','EKORG','EKGRP','WAERS','BEDAT','ERNAM','RLWRT'],
+            EKPO: ['EBELN','EBELP','MATNR','TXZ01','MENGE','MEINS','NETPR','NETWR','WERKS'],
+            MARA: ['MATNR','MTART','MATKL','MEINS'],
+            MAKT: ['MATNR','SPRAS','MAKTX'],
+            KNA1: ['KUNNR','NAME1','NAME2','ORT01','LAND1','STRAS','PSTLZ'],
+            KNB1: ['KUNNR','BUKRS','AKONT','ZTERM','SPERR'],
+            T001: ['BUKRS','BUTXT','ORT01','LAND1','WAERS'],
+            BKPF: ['BUKRS','BELNR','GJAHR','BLART','BUDAT','BLDAT','WAERS','USNAM'],
+            BSEG: ['BUKRS','BELNR','GJAHR','BUZEI','KOART','SHKZG','DMBTR','WRBTR'],
+            CSKS: ['KOSTL','DATBI','DATAB','BUKRS','KOSAR','KTEXT'],
+            AUFK: ['AUFNR','AUTYP','AUART','BUKRS','WERKS','ERNAM','ERDAT','LOEKZ','KTEXT'],
+            AFKO: ['AUFNR','PLNBEZ','GAMNG','GMEIN','GLTRS','GSTRP'],
+            AFPO: ['AUFNR','POSNR','MATNR','PSMNG','WEMNG','MEINS','WERKS'],
+            EQUI: ['EQUNR','EQTYP','EQART','INBDT','MATNR','SERNR','WERK','EQDAT'],
+            EQKT: ['EQUNR','SPRAS','EQKTX'],
+            EQUZ: ['EQUNR','DATBI','ILOAN','HEQUI'],
+            ILOA: ['ILOAN','TPLNR','ABCKZ','BUKRS','KOKRS','KOSTL','SWERK'],
+            QMEL: ['QMNUM','QMART','QMTXT','ERNAM','ERDAT','STRMN','LTRMN','PRIOK','EQUNR','TPLNR','INGRP'],
+            VIQMEL: ['QMNUM','QMART','QMTXT','ERNAM','ERDAT','EQUNR','TPLNR','AUSVN','AUSBS','AUSZT'],
+            RESB: ['RSNUM','RSPOS','MATNR','BDMNG','MEINS','WERKS','LGORT','AUFNR'],
+            COBK: ['KOKRS','BELNR','BUDAT','BLDAT','VRGNG','AWTYP'],
+            COEP: ['KOKRS','BELNR','BUZEI','OBJNR','KSTAR','WTG001','MEGBTR','MEINH'],
+            COSS: ['OBJNR','GJAHR','WRTTP','KSTAR','WKG001'],
+            COSP: ['OBJNR','GJAHR','WRTTP','KSTAR','WKG001'],
+            QALS: ['PRUEFLOS','MATNR','WERK','LOSMENGE','STAT','AUFNR'],
+            QAVE: ['PRUEFLOS','VORGLFNR','MERKNR','MITKZ'],
+            VBAK: ['VBELN','AUDAT','AUART','VKORG','VTWEG','SPART','KUNNR','NETWR','WAERS','ERNAM','ERDAT'],
+            VBAP: ['VBELN','POSNR','MATNR','ARKTX','KWMENG','VRKME','NETWR','WERKS','LGORT'],
+            VBEP: ['VBELN','POSNR','ETENR','EDATU','WMENG','BMENG','LMENG'],
+            LIKP: ['VBELN','LFART','WADAT','KUNNR','KUNAG','BTGEW','GEWEI','ERNAM','ERDAT'],
+            LIPS: ['VBELN','POSNR','MATNR','ARKTX','LFIMG','MEINS','WERKS','LGORT','VGBEL','VGPOS'],
+            VBRK: ['VBELN','FKART','FKDAT','KUNAG','KUNRG','NETWR','WAERK','BUKRS','ERNAM','ERDAT'],
+            VBRP: ['VBELN','POSNR','MATNR','ARKTX','FKIMG','VRKME','NETWR','AUBEL','AUPOS'],
+            PROJ: ['PSPNR','PSPID','POST1','VERNR','VBUKR','ERNAM','ERDAT'],
+            PRPS: ['PSPNR','POSID','POST1','OBJNR','PSPHI','STUFE'],
+            AFIH: ['AUFNR','ILOAN','EQUNR','TPLNR','IWERK'],
+            MKPF: ['MBLNR','MJAHR','BUDAT','CPUDT','USNAM','VGART','XBLNR'],
+            MSEG: ['MBLNR','MJAHR','ZEILE','BWART','MATNR','WERKS','LGORT','MENGE','MEINS','AUFNR','EBELN','EBELP'],
+            RBKP: ['BELNR','GJAHR','BUKRS','LIFNR','WAERS','RMWWR','CPUDT','USNAM'],
+            RSEG: ['BELNR','GJAHR','BUZEI','EBELN','EBELP','MATNR','MENGE','WRBTR','WERKS'],
+            LQUA: ['LGNUM','LGTYP','LGPLA','MATNR','WERKS','CHARG','GESME','MEINS','VERME'],
+            LTAP: ['LGNUM','TANUM','MATNR','WERKS','VSOLA','MEINS','VLTYP','VLPLA','NLTYP','NLPLA']
+          };
+          const tbl = params.QUERY_TABLE;
+          if (SAFE_FIELDS[tbl]) {
+            params.FIELDS = SAFE_FIELDS[tbl].map(f => ({ FIELDNAME: f }));
+            console.log(`  ⚠️ Auto-injected FIELDS for ${tbl} (AI forgot to specify)`);
+          }
+        }
+        // Force delimiter
+        if (!params.DELIMITER) params.DELIMITER = "|";
+      }
+
+      // ── SECURITY: Block any function not in the whitelist ──────────
+      if (!ALLOWED_FUNCTIONS.has(funcName)) {
+        console.warn(`  🚫 BLOCKED: ${funcName} is not in ALLOWED_FUNCTIONS`);
+        allResults[`${funcName}_${i}_ERROR`] = `Function '${funcName}' is not permitted by this system.`;
+        continue;
+      }
+
+      console.log(`→ SAP Call ${i + 1}: ${funcName}`);
+      console.log("  Params:", JSON.stringify(params).substring(0, 300));
+
+      const isWrite = isWriteBapi(funcName);
+      try {
+        const result = await executeSapRfc(req.user, funcName, params, isWrite);
+
+        // For BAPI_PO_CREATE1, handle result
+        if (funcName === "BAPI_PO_CREATE1") {
+          console.log("BAPI_PO_CREATE1 result keys:", Object.keys(result).join(', '));
+          
+          // SAP returns PO number in EXPPURCHASEORDER (not PURCHASEORDER)
+          const poNum = (result.EXPPURCHASEORDER || result.PURCHASEORDER || "").trim();
+          const returnMsgs = result.RETURN || [];
+          const errors = returnMsgs.filter(r => r.TYPE === 'E' || r.TYPE === 'A');
+          const successMsgs = returnMsgs.filter(r => r.TYPE === 'S');
+          const warnings = returnMsgs.filter(r => r.TYPE === 'W' || r.TYPE === 'I');
+          
+          // Success: PO number exists and no hard errors (warnings are OK)
+          if (poNum && poNum !== '0000000000' && errors.length === 0) {
+            console.log(`✅ Transaction committed. PO: ${poNum}`);
+            let successMsg = `✅ **Purchase Order Created Successfully!**\n\n- **New PO Number**: ${poNum}\n- **Vendor**: ${params.POHEADER?.VENDOR || '—'}\n- **Company Code**: ${params.POHEADER?.COMP_CODE || '—'}\n- **Material**: ${params.POITEM?.[0]?.MATERIAL || '—'}\n- **Quantity**: ${params.POITEM?.[0]?.QUANTITY || '—'}\n- **Plant**: ${params.POITEM?.[0]?.PLANT || '—'}\n- **Delivery Date**: ${params.POSCHEDULE?.[0]?.DELIVERY_DATE || '—'}\n\nYou can now use this PO number to check details: "Show PO ${poNum}"`;
+            // Append warnings if any
+            if (warnings.length > 0) {
+              successMsg += `\n\n⚠️ **Warnings**: ${warnings.map(w => w.MESSAGE).join(', ')}`;
+            }
+            return res.json({ reply: successMsg });
+          } else {
+            console.log("PO Creation failed. Errors:", errors.map(r => r.MESSAGE).join('; '));
+            const errorDetails = errors.map(r => r.MESSAGE).join('\n') || 'No error details returned from SAP.';
+            return res.json({ reply: `⚠️ **PO Creation Failed**\n\n${errorDetails}\n\nPlease check the details and try again.` });
+          }
+        }
+
+        // ── Pre-process RFC_READ_TABLE data ──────────────────────────
+        // Convert pipe-delimited rows into clean JSON so Pass 2 can
+        // work with structured data instead of raw strings
+        if (funcName === "RFC_READ_TABLE" && result.DATA && result.FIELDS) {
+          const fields = result.FIELDS.map(f => f.FIELDNAME);
+          const rows = result.DATA.map(row => {
+            const values = row.WA.split("|");
+            const obj = {};
+            fields.forEach((f, idx) => {
+              obj[f] = (values[idx] || "").trim();
+            });
+            return obj;
+          });
+          allResults[`${funcName}_${i}`] = {
+            table: params.QUERY_TABLE,
+            fields: fields,
+            rowCount: rows.length,
+            rows: rows
+          };
+          console.log(`  ✅ ${params.QUERY_TABLE}: ${rows.length} rows, fields: ${fields.join(', ')}`);
+        } else {
+          allResults[`${funcName}_${i}`] = result;
+        }
+
+      } catch (sapErr) {
+        console.error(`SAP Error (${funcName}):`, sapErr.message);
+        allResults[`${funcName}_${i}_ERROR`] = sapErr.message;
+        // ── ROLLBACK: Undo any partial write in this LUW ──────────────
+        if (isWrite) {
+          try {
+            await executeSapRfc(req.user, 'BAPI_TRANSACTION_ROLLBACK', {});
+            console.warn(`  ↩️ ROLLBACK issued after ${funcName} failure.`);
+          } catch (rbErr) {
+            console.error('  ROLLBACK failed:', rbErr.message);
+          }
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════
+    //  MERGE ENGINE: Progressive N-table join
+    // ═══════════════════════════════════════
+    // JOIN LOGIC: Only merge if there's a specific transactional/master key.
+    // We EXCLUDE organizational keys (BUKRS, KOKRS) from merging to prevent 
+    // "Cartesian Explosions" (e.g. joining 100 vendors * 100 customers).
+    const COMMON_KEYS = [
+      'LIFNR','MATNR','EBELN','KUNNR','AUFNR','EQUNR',
+      'QMNUM','TPLNR','VBELN','BANFN','BELNR','MBLNR','PSPNR',
+      'POSID','KOSTL','LGNUM','PERNR','ILOAN','RSNUM','PRUEFLOS',
+      'OBJNR','TBNUM'
+    ];
+    let rfcResults = Object.entries(allResults).filter(([k, v]) => v && v.rows);
+
+    while (rfcResults.length > 1) {
+      const [key1, table1] = rfcResults[0];
+      const [key2, table2] = rfcResults[1];
+      const commonKey = COMMON_KEYS.find(k => table1.fields.includes(k) && table2.fields.includes(k));
+
+      if (!commonKey) {
+        console.log(`[Merge] No specific master-key join between ${table1.table} and ${table2.table}, will present as separate sections.`);
+        break;
+      }
+
+      console.log(`[Merge] Joining ${table1.table} + ${table2.table} on ${commonKey}`);
+
+      // Build lookup from table2 — support one-to-many (multiple rows per key)
+      const lookup = {};
+      table2.rows.forEach(row => {
+        const keyVal = row[commonKey];
+        if (keyVal) {
+          if (!lookup[keyVal]) lookup[keyVal] = [];
+          lookup[keyVal].push(row);
+        }
+      });
+
+      const newFields = table2.fields.filter(f => !table1.fields.includes(f));
+      const mergedRows = [];
+      const MAX_MERGED_ROWS = 5000; // Safeguard against OOM crashes (Exit 1)
+
+      for (const row of table1.rows) {
+        const matches = lookup[row[commonKey]];
+        if (matches && matches.length > 0) {
+          for (const match of matches) {
+            if (mergedRows.length >= MAX_MERGED_ROWS) break;
+            const merged = { ...row };
+            newFields.forEach(f => { merged[f] = match[f] || ''; });
+            mergedRows.push(merged);
+          }
+        } else {
+          const merged = { ...row };
+          newFields.forEach(f => { merged[f] = ''; });
+          mergedRows.push(merged);
+        }
+        if (mergedRows.length >= MAX_MERGED_ROWS) {
+          console.warn(`  ⚠️ Merge capped at ${MAX_MERGED_ROWS} rows to prevent server crash.`);
+          break;
+        }
+      }
+
+      // Replace table1 with merged result, remove table2
+      allResults[key1] = {
+        table: `${table1.table} + ${table2.table}`,
+        fields: [...table1.fields, ...newFields],
+        rowCount: mergedRows.length,
+        rows: mergedRows,
+        wasCapped: mergedRows.length >= MAX_MERGED_ROWS
+      };
+      delete allResults[key2];
+      
+      // Re-scan for remaining RFC results to merge next
+      rfcResults = Object.entries(allResults).filter(([k, v]) => v && v.rows);
+    }
+
+    // ═══════════════════════════════════════
+    //  PASS 2: AI formats the result
+    // ═══════════════════════════════════════
+    const callInfo = calls.map(c => `${c.function}(${(c.params?.QUERY_TABLE || c.params?.PURCHASEORDER || '')})`).join(" + ");
+    console.log(`[Pass 2] Sending to AI: ${callInfo}, data size: ${JSON.stringify(allResults).length} chars`);
+
+    let formattedReply;
+    try {
+      formattedReply = await aiFormatResult(message, callInfo, allResults);
+    } catch (aiErr) {
+      console.error("Pass 2 error:", aiErr.message);
+      // Fallback: Build a proper markdown table from pre-processed data
+      const parts = [];
+      for (const [key, val] of Object.entries(allResults)) {
+        if (typeof val === 'string') {
+          parts.push(`❌ Error: ${val}`);
+        } else if (val.rows && val.rows.length > 0) {
+          parts.push(`✅ ${val.table}: ${val.rowCount} record(s)\n`);
+          // Build markdown table header
+          const fields = val.fields;
+          parts.push('| ' + fields.join(' | ') + ' |');
+          parts.push('|' + fields.map(() => '---').join('|') + '|');
+          // Data rows (max 50)
+          val.rows.slice(0, 50).forEach(row => {
+            parts.push('| ' + fields.map(f => (row[f] || '').trim() || '—').join(' | ') + ' |');
+          });
+          if (val.rowCount > 50) parts.push(`\n... and ${val.rowCount - 50} more records`);
+        } else if (val.POHEADER) {
+          parts.push(`PO data received but formatting failed. Please try again.`);
+        }
+      }
+      formattedReply = parts.join('\n') || 'SAP returned data but formatting failed.';
+    }
+
+    console.log("[Pass 2 — Formatted Reply]", formattedReply.substring(0, 200));
+
+    return res.json({ reply: formattedReply });
+
+  } catch (err) {
+    console.error("CHAT ENDPOINT ERROR:", err.message);
+    return res.status(500).json({ message: err.message });
+  }
+});
+
+
+/* ===============================
+   START SERVER
+================================= */
+
+app.listen(PORT, () => {
+  console.log("=========================================");
+  console.log("🚀 SAP Conversational Middleware v3.1");
+  console.log(`📡 Port: ${PORT}`);
+  console.log(`🕒 Started: ${new Date().toLocaleString()}`);
+  console.log("=========================================");
+
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey.startsWith("YOUR_")) {
+    console.warn("⚠️  OPENAI_API_KEY not set — chat will fail.");
+  } else {
+    console.log(`✅ OpenAI: key loaded (${apiKey.substring(0, 8)}...)`);
+  }
+
+  if (!process.env.SERVICE_PASSWORD) {
+    console.warn("⚠️  SERVICE_PASSWORD not set — SAP BAPI calls will fail.");
+  } else {
+    console.log("✅ SAP service password: loaded");
+  }
+});
